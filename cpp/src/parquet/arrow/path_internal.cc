@@ -840,6 +840,26 @@ class PathBuilder {
     return Status::OK();
   }
 
+  // A sparse union is written as a group: the type codes first, then every child
+  // (all of them as long as the union). It has no validity bitmap of its own, a
+  // null is a null of the selected child, so no definition level is added for it.
+  Status Visit(const ::arrow::SparseUnionArray& array) {
+    PathInfo info_backup = info_;
+    nullable_in_parent_ = false;
+    ::arrow::Int8Array type_codes(array.length(), array.type_codes(),
+                                  /*null_bitmap=*/nullptr, /*null_count=*/0,
+                                  array.offset());
+    RETURN_NOT_OK(VisitInline(type_codes));
+    info_ = info_backup;
+    for (int x = 0; x < array.num_fields(); x++) {
+      nullable_in_parent_ = array.type()->field(x)->nullable();
+      // field() accounts for the offset and length of the union
+      RETURN_NOT_OK(VisitInline(*array.field(x)));
+      info_ = info_backup;
+    }
+    return Status::OK();
+  }
+
   Status Visit(const ::arrow::FixedSizeListArray& array) {
     MaybeAddNullable(array);
     int32_t list_size = array.list_type()->list_size();
@@ -867,7 +887,7 @@ class PathBuilder {
                                   " not supported yet");                   \
   }
 
-  // Types not yet supported in Parquet.
+  // Types not yet supported in Parquet (dense unions, sparse unions are handled above).
   NOT_IMPLEMENTED_VISIT(Union)
   NOT_IMPLEMENTED_VISIT(RunEndEncoded);
 

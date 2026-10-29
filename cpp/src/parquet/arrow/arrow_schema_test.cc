@@ -1509,12 +1509,50 @@ TEST_F(TestConvertArrowSchema, ArrowNonconvertibleFields) {
   std::vector<FieldConstructionArguments> cases = {
       {"run_end_encoded",
        ::arrow::run_end_encoded(::arrow::int32(), ::arrow::list(::arrow::int8()))},
+      {"dense_union", ::arrow::dense_union({::arrow::field("a", ::arrow::int32())})},
   };
 
   for (const FieldConstructionArguments& c : cases) {
     auto field = ::arrow::field(c.name, c.datatype);
     ASSERT_RAISES(NotImplemented, ConvertSchema({field}));
   }
+}
+
+TEST_F(TestConvertArrowSchema, ParquetSparseUnion) {
+  // A sparse union is written as a required group, whatever the nullability of the
+  // field: the type codes first, then one column per union field.
+  //
+  // required group u {
+  //   required int32 type_id (INT(8, true));
+  //   optional int64 a;
+  //   optional binary b (UTF8);
+  // }
+  for (bool nullable : {true, false}) {
+    auto type_codes =
+        PrimitiveNode::Make("type_id", Repetition::REQUIRED,
+                            LogicalType::Int(8, /*is_signed=*/true), ParquetType::INT32);
+    auto a = PrimitiveNode::Make("a", Repetition::OPTIONAL, ParquetType::INT64,
+                                 ConvertedType::NONE);
+    auto b = PrimitiveNode::Make("b", Repetition::OPTIONAL, ParquetType::BYTE_ARRAY,
+                                 ConvertedType::UTF8);
+    std::vector<NodePtr> parquet_fields = {
+        GroupNode::Make("u", Repetition::REQUIRED, {type_codes, a, b})};
+    auto union_type = ::arrow::sparse_union(
+        {::arrow::field("a", INT64, true), ::arrow::field("b", UTF8, true)});
+    ASSERT_OK(ConvertSchema({::arrow::field("u", union_type, nullable)}));
+    ASSERT_NO_FATAL_FAILURE(CheckFlatSchema(parquet_fields));
+  }
+}
+
+TEST_F(TestConvertArrowSchema, ParquetSparseUnionInvalid) {
+  // The name of the type codes column cannot be used by a union field
+  auto clashing = ::arrow::sparse_union({::arrow::field("type_id", INT64)});
+  ASSERT_RAISES(Invalid, ConvertSchema({::arrow::field("u", clashing)}));
+
+  // A union without fields would give a group without the columns to read it back
+  ASSERT_RAISES(NotImplemented,
+                ConvertSchema({::arrow::field(
+                    "u", ::arrow::sparse_union(::arrow::FieldVector{}))}));
 }
 
 TEST_F(TestConvertArrowSchema, ParquetFlatPrimitivesAsDictionaries) {

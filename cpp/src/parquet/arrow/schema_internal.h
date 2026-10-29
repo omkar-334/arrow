@@ -26,6 +26,10 @@ namespace parquet::arrow {
 
 using ::arrow::Result;
 
+/// Name of the first column of the Parquet group that stores a sparse union. That
+/// column holds the type codes, the remaining columns are the union's children.
+inline constexpr char kSparseUnionTypeCodesName[] = "type_id";
+
 Result<::arrow::TimeUnit::type> ArrowTimeUnitFromParquet(
     LogicalType::TimeUnit::unit unit);
 

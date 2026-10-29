@@ -635,3 +635,55 @@ def test_undefined_logical_type(parquet_test_datadir):
         b"unknown string 2",
         b"unknown string 3"
     ]
+
+
+def _sparse_union_array():
+    return pa.UnionArray.from_sparse(
+        pa.array([0, 1, 0, 1], type=pa.int8()),
+        [pa.array([1, None, 3, None]), pa.array([None, "x", None, None])],
+        field_names=["a", "b"])
+
+
+def test_sparse_union_roundtrip():
+    # GH-53595
+    union = _sparse_union_array()
+    table = pa.table({"u": union})
+    result = _roundtrip_table(table)
+    assert result.schema.field("u").type == union.type
+    assert result.equals(table)
+
+
+def test_sparse_union_roundtrip_nested():
+    union = pa.UnionArray.from_sparse(
+        pa.array([5, 7, 5, 7], type=pa.int8()),
+        [pa.array([1, None, 3, None]), pa.array([None, "x", None, None])],
+        field_names=["a", "b"], type_codes=[5, 7])
+    table = pa.table({
+        "list": pa.ListArray.from_arrays([0, 1, 2, 3, 4], union),
+        "struct": pa.StructArray.from_arrays([union], names=["f"]),
+    })
+    result = _roundtrip_table(table)
+    assert result.schema.equals(table.schema)
+    assert result.equals(table)
+
+
+def test_sparse_union_without_stored_schema():
+    table = pa.table({"u": _sparse_union_array()})
+    result = _roundtrip_table(table, write_table_kwargs={"store_schema": False})
+    # Without the stored Arrow schema the group is read as a struct
+    assert pa.types.is_struct(result.schema.field("u").type)
+    assert [f.name for f in result.schema.field("u").type] == ["type_id", "a", "b"]
+    assert result["u"].to_pylist() == [
+        {"type_id": 0, "a": 1, "b": None},
+        {"type_id": 1, "a": None, "b": "x"},
+        {"type_id": 0, "a": 3, "b": None},
+        {"type_id": 1, "a": None, "b": None},
+    ]
+
+
+def test_dense_union_not_supported():
+    union = pa.UnionArray.from_dense(
+        pa.array([0, 1], type=pa.int8()), pa.array([0, 0], type=pa.int32()),
+        [pa.array([1]), pa.array(["x"])], field_names=["a", "b"])
+    with pytest.raises(pa.ArrowNotImplementedError, match="union"):
+        _write_table(pa.table({"u": union}), io.BytesIO())

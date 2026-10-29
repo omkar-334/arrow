@@ -336,7 +336,9 @@ back to original Arrow types includes:
   columns);
 * Reading string and binary columns back into large variants with 64-bit offsets;
 * Reading back columns as dictionary encoded (whether an Arrow column and
-  the serialized Parquet version are dictionary encoded are independent).
+  the serialized Parquet version are dictionary encoded are independent);
+* Reading sparse unions back from the group they are written as (see
+  :ref:`parquet-cpp-sparse-union`).
 
 Supported Parquet features
 ==========================
@@ -589,6 +591,23 @@ Limitations
 ~~~~~~~~~~~
 
 Writing or reading back FixedSizedList data with null entries is not supported.
+
+.. _parquet-cpp-sparse-union:
+
+Sparse unions
+~~~~~~~~~~~~~
+
+Parquet has no union type. An Arrow sparse union is written as a required group
+holding a ``type_id`` column with the type codes (``int8``), followed by one
+column per union field. All of the union fields are as long as the union, so no
+value is lost. A union field cannot be named ``type_id``.
+
+When the Arrow schema is stored (see :func:`ArrowWriterProperties::store_schema`),
+the group is read back as the original sparse union. Without it, or when reading
+the file with another Parquet implementation, the group is read as a struct. A
+sparse union can only be read back when all of its columns are read.
+
+Dense unions are not supported.
 
 Encryption
 ----------

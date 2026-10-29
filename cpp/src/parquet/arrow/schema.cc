@@ -175,6 +175,38 @@ Status StructToNode(const std::shared_ptr<::arrow::StructType>& type,
   return Status::OK();
 }
 
+// Parquet has no union type. A sparse union is stored as a required group made of
+// a column with the type codes followed by one column per child. All children are
+// as long as the union, so no information is lost. The union is restored on read
+// from the stored Arrow schema.
+Status SparseUnionToNode(const std::shared_ptr<::arrow::SparseUnionType>& type,
+                         const std::string& name, int field_id,
+                         const WriterProperties& properties,
+                         const ArrowWriterProperties& arrow_properties, NodePtr* out) {
+  if (type->num_fields() == 0) {
+    return Status::NotImplemented("Cannot write sparse union type '", name,
+                                  "' with no child field to Parquet.");
+  }
+  std::vector<NodePtr> children(type->num_fields() + 1);
+  PARQUET_CATCH_NOT_OK(children[0] = PrimitiveNode::Make(
+                           kSparseUnionTypeCodesName, Repetition::REQUIRED,
+                           LogicalType::Int(8, /*is_signed=*/true), ParquetType::INT32));
+  for (int i = 0; i < type->num_fields(); i++) {
+    const auto& child = type->field(i);
+    if (child->name() == kSparseUnionTypeCodesName) {
+      return Status::Invalid("Cannot write sparse union '", name,
+                             "' with a field named '", kSparseUnionTypeCodesName,
+                             "' to Parquet, the name is used for the type codes column");
+    }
+    RETURN_NOT_OK(FieldToNode(child->name(), child, properties, arrow_properties,
+                              &children[i + 1]));
+  }
+  // A union has no validity bitmap of its own (nulls live in the children), so the
+  // group is always required.
+  *out = GroupNode::Make(name, Repetition::REQUIRED, children, nullptr, field_id);
+  return Status::OK();
+}
+
 static std::shared_ptr<const LogicalType> TimestampLogicalTypeFromArrowTimestamp(
     const ::arrow::TimestampType& timestamp_type, ::arrow::TimeUnit::type time_unit) {
   const bool utc = !(timestamp_type.timezone().empty());
@@ -509,8 +541,14 @@ Status FieldToNode(const std::string& name, const std::shared_ptr<Field>& field,
                        arrow_properties, out);
     }
 
+    case ArrowTypeId::SPARSE_UNION: {
+      auto union_type = std::static_pointer_cast<::arrow::SparseUnionType>(field->type());
+      return SparseUnionToNode(union_type, name, field_id, properties, arrow_properties,
+                               out);
+    }
+
     default: {
-      // TODO: DENSE_UNION, SPARSE_UNION
+      // TODO: DENSE_UNION
       return Status::NotImplemented(
           "Unhandled type for Arrow to Parquet schema conversion: ",
           field->type()->ToString());
@@ -1041,12 +1079,53 @@ std::function<std::shared_ptr<::arrow::DataType>(FieldVector)> GetNestedFactory(
   return {};
 }
 
+// Whether the inferred type is the struct a sparse union is written as: the type codes
+// column followed by one column per union field.
+bool IsSparseUnionStorage(const ArrowType& origin_type, const ArrowType& inferred_type) {
+  if (origin_type.id() != ::arrow::Type::SPARSE_UNION ||
+      inferred_type.id() != ::arrow::Type::STRUCT ||
+      inferred_type.num_fields() != origin_type.num_fields() + 1) {
+    return false;
+  }
+  const auto& type_codes = inferred_type.field(0);
+  if (type_codes->name() != kSparseUnionTypeCodesName ||
+      type_codes->type()->id() != ::arrow::Type::INT8) {
+    return false;
+  }
+  for (int i = 0; i < origin_type.num_fields(); ++i) {
+    if (inferred_type.field(i + 1)->name() != origin_type.field(i)->name()) {
+      return false;
+    }
+  }
+  return true;
+}
+
 Result<bool> ApplyOriginalStorageMetadata(const Field& origin_field,
                                           SchemaField* inferred) {
   bool modified = false;
 
   auto& origin_type = origin_field.type();
   auto& inferred_type = inferred->field->type();
+
+  if (IsSparseUnionStorage(*origin_type, *inferred_type)) {
+    // Read the group back as the union it was written from. The first child holds
+    // the type codes, the others are the union fields.
+    const auto& origin_union =
+        checked_cast<const ::arrow::SparseUnionType&>(*origin_type);
+    FieldVector union_fields(origin_union.num_fields());
+    for (int i = 0; i < origin_union.num_fields(); ++i) {
+      RETURN_NOT_OK(
+          ApplyOriginalMetadata(*origin_union.field(i), &inferred->children[i + 1])
+              .status());
+      union_fields[i] = inferred->children[i + 1].field;
+    }
+    inferred->field = inferred->field->WithType(
+        ::arrow::sparse_union(std::move(union_fields), origin_union.type_codes()));
+    // The group is always required but a union has no validity of its own,
+    // what matters is the nullability the field was declared with.
+    inferred->field = inferred->field->WithNullable(origin_field.nullable());
+    return true;
+  }
 
   const int num_children = inferred_type->num_fields();
 

@@ -88,7 +88,8 @@ int CalculateLeafCount(const DataType* type) {
     return 1;
   }
 
-  int num_leaves = 0;
+  // A sparse union is written with an additional leaf for its type codes
+  int num_leaves = type->id() == ::arrow::Type::SPARSE_UNION ? 1 : 0;
   for (const auto& field : type->fields()) {
     num_leaves += CalculateLeafCount(field->type().get());
   }

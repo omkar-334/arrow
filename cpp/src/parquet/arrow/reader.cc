@@ -18,6 +18,7 @@
 #include "parquet/arrow/reader.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <iterator>
 #include <memory>
@@ -594,6 +595,89 @@ class ExtensionReader : public ColumnReaderImpl {
   std::unique_ptr<ColumnReaderImpl> storage_reader_;
 };
 
+// Reads the group a sparse union is stored as (see SparseUnionToNode in schema.cc),
+// using a struct reader whose first child is the type codes, and exposes the result
+// as a sparse union.
+class SparseUnionReader : public ColumnReaderImpl {
+ public:
+  SparseUnionReader(std::shared_ptr<Field> field,
+                    std::unique_ptr<ColumnReaderImpl> struct_reader, MemoryPool* pool,
+                    bool may_be_hidden)
+      : field_(std::move(field)),
+        struct_reader_(std::move(struct_reader)),
+        pool_(pool),
+        may_be_hidden_(may_be_hidden) {}
+
+  Status GetDefLevels(const int16_t** data, int64_t* length) override {
+    return struct_reader_->GetDefLevels(data, length);
+  }
+
+  Status GetRepLevels(const int16_t** data, int64_t* length) override {
+    return struct_reader_->GetRepLevels(data, length);
+  }
+
+  Status LoadBatch(int64_t number_of_records) final {
+    return struct_reader_->LoadBatch(number_of_records);
+  }
+
+  Status BuildArray(int64_t length_upper_bound,
+                    std::shared_ptr<ChunkedArray>* out) override {
+    std::shared_ptr<ChunkedArray> struct_array;
+    RETURN_NOT_OK(struct_reader_->BuildArray(length_upper_bound, &struct_array));
+    ARROW_ASSIGN_OR_RAISE(std::shared_ptr<ArrayData> struct_data,
+                          ChunksToSingle(*struct_array));
+
+    // The first child holds the type codes, the other ones the union fields.
+    const std::shared_ptr<ArrayData>& type_codes = struct_data->child_data[0];
+    std::shared_ptr<::arrow::Buffer> type_codes_buffer = type_codes->buffers[1];
+    if (may_be_hidden_) {
+      // The type codes are stored in a required column, so there is no value for the
+      // slots hidden by a null parent (for example a null struct holding the union).
+      // They are read as 0, which is not necessarily one of the type codes of the
+      // union. Those slots are never read, but a union must only hold valid type codes.
+      const auto& union_type =
+          checked_cast<const ::arrow::SparseUnionType&>(*field_->type());
+      std::array<bool, 256> is_valid_code{};
+      for (int8_t code : union_type.type_codes()) {
+        is_valid_code[static_cast<uint8_t>(code)] = true;
+      }
+      const uint8_t default_code = static_cast<uint8_t>(union_type.type_codes().front());
+      ARROW_ASSIGN_OR_RAISE(std::unique_ptr<::arrow::Buffer> fixed,
+                            ::arrow::AllocateBuffer(type_codes->length, pool_));
+      auto* out_codes = fixed->mutable_data();
+      const auto* in_codes = type_codes_buffer->data() + type_codes->offset;
+      for (int64_t i = 0; i < type_codes->length; ++i) {
+        out_codes[i] = is_valid_code[in_codes[i]] ? in_codes[i] : default_code;
+      }
+      type_codes_buffer = std::move(fixed);
+    } else if (type_codes->offset != 0) {
+      // The type codes are int8, so the offset in elements is the offset in bytes.
+      type_codes_buffer =
+          ::arrow::SliceBuffer(type_codes_buffer, type_codes->offset, type_codes->length);
+    }
+    std::vector<std::shared_ptr<ArrayData>> children(struct_data->child_data.begin() + 1,
+                                                     struct_data->child_data.end());
+    auto data = ArrayData::Make(field_->type(), type_codes->length,
+                                {/*validity=*/nullptr, std::move(type_codes_buffer)},
+                                std::move(children), /*null_count=*/0);
+    *out = std::make_shared<ChunkedArray>(::arrow::MakeArray(std::move(data)));
+    return Status::OK();
+  }
+
+  bool IsOrHasRepeatedChild() const final {
+    return struct_reader_->IsOrHasRepeatedChild();
+  }
+
+  const std::shared_ptr<Field> field() override { return field_; }
+
+ private:
+  std::shared_ptr<Field> field_;
+  std::unique_ptr<ColumnReaderImpl> struct_reader_;
+  MemoryPool* pool_;
+  // Whether a nullable ancestor can hide some slots of the union
+  bool may_be_hidden_;
+};
+
 template <typename IndexType>
 class ListReader : public ColumnReaderImpl {
  public:
@@ -1097,6 +1181,48 @@ Status GetReader(const SchemaField& field, const std::shared_ptr<Field>& arrow_f
                        arrow_field->nullable(), arrow_field->metadata());
     *out = std::make_unique<StructReader>(ctx, filtered_field, field.level_info,
                                           std::move(child_readers));
+  } else if (type_id == ::arrow::Type::SPARSE_UNION) {
+    // Stored as a group: the type codes column followed by one column per union field
+    const auto& union_type =
+        checked_cast<const ::arrow::SparseUnionType&>(*arrow_field->type());
+    if (field.children.size() != static_cast<size_t>(union_type.num_fields()) + 1) {
+      return Status::Invalid("Parquet group does not match the sparse union ",
+                             arrow_field->ToString());
+    }
+    std::vector<std::shared_ptr<Field>> child_fields;
+    std::vector<std::unique_ptr<ColumnReaderImpl>> child_readers;
+    for (const auto& child : field.children) {
+      std::unique_ptr<ColumnReaderImpl> child_reader;
+      RETURN_NOT_OK(GetReader(child, ctx, &child_reader));
+      if (!child_reader) {
+        // A union cannot be built from a subset of its columns
+        return Status::Invalid(
+            "Due to column pruning only part of a sparse union was loaded. "
+            "A sparse union cannot be created without all of its fields");
+      }
+      std::shared_ptr<::arrow::Field> child_field = child.field;
+      if (!child_field->type()->Equals(child_reader->field()->type())) {
+        // Nested children may have been pruned
+        child_field = child_field->WithType(child_reader->field()->type());
+      }
+      child_fields.push_back(std::move(child_field));
+      child_readers.emplace_back(std::move(child_reader));
+    }
+    auto struct_field =
+        ::arrow::field(arrow_field->name(), ::arrow::struct_(child_fields),
+                       /*nullable=*/false, arrow_field->metadata());
+    auto struct_reader = std::make_unique<StructReader>(
+        ctx, std::move(struct_field), field.level_info, std::move(child_readers));
+
+    child_fields.erase(child_fields.begin());  // drop the type codes
+    auto union_field = ::arrow::field(
+        arrow_field->name(),
+        ::arrow::sparse_union(std::move(child_fields), union_type.type_codes()),
+        arrow_field->nullable(), arrow_field->metadata());
+    const bool may_be_hidden =
+        field.level_info.def_level > field.level_info.repeated_ancestor_def_level;
+    *out = std::make_unique<SparseUnionReader>(
+        std::move(union_field), std::move(struct_reader), ctx->pool, may_be_hidden);
   } else {
     return Status::Invalid("Unsupported nested type: ", arrow_field->ToString());
   }

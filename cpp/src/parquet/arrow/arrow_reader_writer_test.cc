@@ -6241,5 +6241,143 @@ TEST(TestArrowReadWrite, AllNulls) {
   ASSERT_TRUE(expected_table->Equals(*read_table));
 }
 
+// ----------------------------------------------------------------------
+// Sparse unions. Parquet has no union type: they are written as a group made of the
+// type codes and the union fields, and restored from the stored Arrow schema.
+
+namespace {
+
+std::shared_ptr<::parquet::ArrowWriterProperties> StoreSchemaProperties() {
+  return ::parquet::ArrowWriterProperties::Builder().store_schema()->build();
+}
+
+std::shared_ptr<::arrow::DataType> TestSparseUnionType(std::vector<int8_t> type_codes = {
+                                                           0, 1}) {
+  return ::arrow::sparse_union(
+      {::arrow::field("a", ::arrow::int64()), ::arrow::field("b", ::arrow::utf8())},
+      std::move(type_codes));
+}
+
+}  // namespace
+
+TEST(TestArrowReadWrite, SparseUnion) {
+  for (const std::vector<int8_t>& type_codes :
+       {std::vector<int8_t>{0, 1}, std::vector<int8_t>{5, 7}}) {
+    SCOPED_TRACE("type_codes[0] = " + std::to_string(type_codes[0]));
+    auto type = TestSparseUnionType(type_codes);
+    const std::string a = std::to_string(type_codes[0]);
+    const std::string b = std::to_string(type_codes[1]);
+    auto array = ArrayFromJSON(type, "[[" + a + ", 1], [" + b + ", \"x\"], [" + a +
+                                         ", null], [" + b + ", null], [" + a + ", 5]]");
+    auto schema = ::arrow::schema(
+        {::arrow::field("id", ::arrow::int32()), ::arrow::field("u", type),
+         ::arrow::field("required_u", type, /*nullable=*/false)});
+    auto table = Table::Make(
+        schema, {ArrayFromJSON(::arrow::int32(), "[1, 2, 3, 4, 5]"), array, array});
+    for (int64_t row_group_size : {5, 2}) {
+      ASSERT_NO_FATAL_FAILURE(
+          CheckSimpleRoundtrip(table, row_group_size, StoreSchemaProperties()));
+    }
+  }
+}
+
+TEST(TestArrowReadWrite, SparseUnionSliced) {
+  auto type = TestSparseUnionType();
+  auto array = ArrayFromJSON(
+      type, R"([[0, 1], [1, "x"], [0, null], [1, null], [0, 5], [1, "y"]])");
+  auto table = Table::Make(::arrow::schema({::arrow::field("u", type)}), {array});
+  ASSERT_NO_FATAL_FAILURE(
+      CheckSimpleRoundtrip(table->Slice(2, 3), 3, StoreSchemaProperties()));
+}
+
+TEST(TestArrowReadWrite, SparseUnionNested) {
+  auto type = TestSparseUnionType();
+  auto list_type = ::arrow::list(type);
+  auto struct_type = ::arrow::struct_({::arrow::field("s", type)});
+  auto union_of_nested = ::arrow::sparse_union(
+      {::arrow::field("l", ::arrow::list(::arrow::int32())),
+       ::arrow::field("st", ::arrow::struct_({::arrow::field("x", ::arrow::int8())}))});
+
+  auto schema = ::arrow::schema({::arrow::field("list", list_type),
+                                 ::arrow::field("struct", struct_type),
+                                 ::arrow::field("nested", union_of_nested)});
+  auto table = Table::Make(
+      schema,
+      {ArrayFromJSON(list_type, R"([[[0, 1], [1, "x"]], null, [], [[0, null]]])"),
+       // The struct is null in a row: the union hidden by it must be read back valid
+       ArrayFromJSON(struct_type,
+                     R"([{"s": [0, 1]}, null, {"s": [1, "x"]}, {"s": [1, null]}])"),
+       ArrayFromJSON(union_of_nested,
+                     R"([[0, [1, 2]], [1, {"x": 3}], [0, null], [1, null]])")});
+  for (int64_t row_group_size : {4, 3}) {
+    ASSERT_NO_FATAL_FAILURE(
+        CheckSimpleRoundtrip(table, row_group_size, StoreSchemaProperties()));
+  }
+}
+
+TEST(TestArrowReadWrite, SparseUnionNestedCustomTypeCodes) {
+  // Slots hidden by a null struct must be read back with a valid type code, 0 is not one
+  auto type = TestSparseUnionType({5, 7});
+  auto struct_type = ::arrow::struct_({::arrow::field("s", type)});
+  auto table = Table::Make(
+      ::arrow::schema({::arrow::field("struct", struct_type)}),
+      {ArrayFromJSON(struct_type, R"([null, {"s": [5, 1]}, null, {"s": [7, "x"]}])")});
+  ASSERT_NO_FATAL_FAILURE(CheckSimpleRoundtrip(table, 4, StoreSchemaProperties()));
+}
+
+TEST(TestArrowReadWrite, SparseUnionWithoutStoredSchema) {
+  // Without the Arrow schema the group is read as the struct it is written as
+  auto type = TestSparseUnionType({5, 7});
+  auto array = ArrayFromJSON(type, R"([[5, 1], [7, "x"], [5, null]])");
+  auto table = Table::Make(::arrow::schema({::arrow::field("u", type)}), {array});
+
+  std::shared_ptr<Table> result;
+  ASSERT_NO_FATAL_FAILURE(
+      DoSimpleRoundtrip(table, /*use_threads=*/false, table->num_rows(), {}, &result));
+  ASSERT_OK(result->ValidateFull());
+
+  auto expected_type = ::arrow::struct_(
+      {::arrow::field("type_id", ::arrow::int8(), false),
+       ::arrow::field("a", ::arrow::int64()), ::arrow::field("b", ::arrow::utf8())});
+  ASSERT_TRUE(result->schema()->field(0)->type()->Equals(*expected_type));
+  auto expected = ArrayFromJSON(expected_type, R"([{"type_id": 5, "a": 1, "b": null},
+                         {"type_id": 7, "a": null, "b": "x"},
+                         {"type_id": 5, "a": null, "b": null}])");
+  ::arrow::AssertChunkedEqual(::arrow::ChunkedArray(expected), *result->column(0));
+}
+
+TEST(TestArrowReadWrite, SparseUnionColumnPruning) {
+  auto type = TestSparseUnionType();
+  auto array = ArrayFromJSON(type, R"([[0, 1], [1, "x"]])");
+  auto table = Table::Make(::arrow::schema({::arrow::field("id", ::arrow::int32()),
+                                            ::arrow::field("u", type)}),
+                           {ArrayFromJSON(::arrow::int32(), "[1, 2]"), array});
+
+  std::shared_ptr<Buffer> buffer;
+  ASSERT_NO_FATAL_FAILURE(WriteTableToBuffer(table, 2, StoreSchemaProperties(), &buffer));
+  ASSERT_OK_AND_ASSIGN(auto reader, OpenFile(std::make_shared<BufferReader>(buffer),
+                                             default_memory_pool()));
+
+  // Leaves: 0 = id, 1 = u.type_id, 2 = u.a, 3 = u.b
+  std::shared_ptr<Table> result;
+  ASSERT_OK(reader->ReadTable({0, 1, 2, 3}, &result));
+  ASSERT_OK(result->ValidateFull());
+  ASSERT_TRUE(result->Equals(*table));
+
+  // A union cannot be rebuilt from some of its columns
+  ASSERT_RAISES(Invalid, reader->ReadTable({0, 2, 3}, &result));
+  ASSERT_RAISES(Invalid, reader->ReadTable({1, 2}, &result));
+}
+
+TEST(TestArrowReadWrite, DenseUnionNotSupported) {
+  auto type = ::arrow::dense_union({::arrow::field("a", ::arrow::int32())});
+  auto array = ArrayFromJSON(type, "[[0, 1]]");
+  auto table = Table::Make(::arrow::schema({::arrow::field("u", type)}), {array});
+  auto sink = CreateOutputStream();
+  ASSERT_RAISES(NotImplemented,
+                WriteTable(*table, default_memory_pool(), sink, 1,
+                           default_writer_properties(), StoreSchemaProperties()));
+}
+
 }  // namespace arrow
 }  // namespace parquet
